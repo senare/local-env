@@ -1,0 +1,106 @@
+# cloud-config
+---
+package_update: true
+package_upgrade: true
+packages:
+  - curl
+  - unzip
+  - gnupg
+  - apt-transport-https
+  - ca-certificates
+  - software-properties-common
+  - bash-completion
+  - vim
+  - docker.io
+  - docker-compose-plugin
+  - skopeo
+  - kitty
+  - kubectx
+  - systemd-timesyncd
+
+runcmd:
+  # --- Docker group setup ---
+  - usermod -aG docker ubuntu
+
+  # --- AWS CLI (ARM64) ---
+  - curl "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o "/tmp/awscliv2.zip"
+  - unzip /tmp/awscliv2.zip -d /tmp
+  - /tmp/aws/install
+  - rm -rf /tmp/aws /tmp/awscliv2.zip
+
+  # --- eksctl (EKS CLI, ARM64) ---
+  - EKS_VER=$(curl -s https://api.github.com/repos/eksctl-io/eksctl/releases/latest | grep tag_name | cut -d '"' -f 4)
+  - curl -L "https://github.com/eksctl-io/eksctl/releases/download/${EKS_VER}/eksctl_Linux_arm64.tar.gz" -o /tmp/eksctl.tar.gz
+  - tar -xzf /tmp/eksctl.tar.gz -C /usr/local/bin eksctl
+  - chmod +x /usr/local/bin/eksctl
+  - rm -f /tmp/eksctl.tar.gz
+
+  # --- aws-vault (ARM64) ---
+  - curl -L "https://github.com/99designs/aws-vault/releases/latest/download/aws-vault-linux-arm64" -o /usr/local/bin/aws-vault
+  - chmod +x /usr/local/bin/aws-vault
+
+  # --- kubectl (ARM64) ---
+  - KUBECTL_VER=$(curl -L -s https://dl.k8s.io/release/stable.txt)
+  - curl -L "https://dl.k8s.io/release/${KUBECTL_VER}/bin/linux/arm64/kubectl" -o /usr/local/bin/kubectl
+  - chmod +x /usr/local/bin/kubectl
+
+  # --- Helm (ARM64) ---
+  - curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+  # --- Terraform (ARM64) ---
+  - curl -fsSL https://apt.releases.hashicorp.com/gpg | gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+  - echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" > /etc/apt/sources.list.d/hashicorp.list
+  - apt-get update && apt-get install -y terraform
+
+  # --- k9s (ARM64) ---
+  - K9S_VER=$(curl -s https://api.github.com/repos/derailed/k9s/releases/latest | grep tag_name | cut -d '"' -f 4)
+  - curl -L "https://github.com/derailed/k9s/releases/download/${K9S_VER}/k9s_Linux_arm64.tar.gz" -o /tmp/k9s.tar.gz
+  - tar -xzf /tmp/k9s.tar.gz -C /usr/local/bin k9s
+  - chmod +x /usr/local/bin/k9s
+  - rm -f /tmp/k9s.tar.gz
+
+  # --- ORAS (ARM64) ---
+  - ORAS_VER=$(curl -s https://api.github.com/repos/oras-project/oras/releases/latest | grep tag_name | cut -d '"' -f 4)
+  - curl -L "https://github.com/oras-project/oras/releases/download/${ORAS_VER}/oras_${ORAS_VER#v}_linux_arm64.tar.gz" -o /tmp/oras.tar.gz
+  - tar -xzf /tmp/oras.tar.gz -C /usr/local/bin oras
+  - chmod +x /usr/local/bin/oras
+  - rm -f /tmp/oras.tar.gz
+
+  # --- Docker Compose binary (legacy CLI support) ---
+  - COMPOSE_VER=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | grep tag_name | cut -d '"' -f 4)
+  - curl -L "https://github.com/docker/compose/releases/download/${COMPOSE_VER}/docker-compose-linux-aarch64" -o /usr/local/bin/docker-compose
+  - chmod +x /usr/local/bin/docker-compose
+
+  # --- Kyverno Chainsaw ---
+  - curl -L -o /tmp/chainsaw_linux_arm64.tar.gz https://github.com/kyverno/chainsaw/releases/download/v0.2.13/chainsaw_linux_arm64.tar.gz
+  - tar -xvf /tmp/chainsaw_linux_arm64.tar.gz -C /tmp
+  - mv /tmp/chainsaw /usr/local/bin/
+  - chmod +x /usr/local/bin/chainsaw
+
+  # --- ArgoCD CLI ---
+  - curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/download/v3.1.8/argocd-linux-arm64
+  - chmod +x argocd
+  - sudo mv argocd /usr/local/bin/
+
+  # --- GoLang (ARM64) ---
+  - GO_VER=$(curl -s https://go.dev/VERSION?m=text | head -n 1)
+  - curl -L "https://go.dev/dl/${GO_VER}.linux-arm64.tar.gz" -o /tmp/go.tar.gz
+  - mkdir -p /tmp/go-extract
+  - tar -xzf /tmp/go.tar.gz -C /tmp/go-extract
+  - rm -rf /usr/local/go
+  - mv /tmp/go-extract/go /usr/local/
+  - echo 'export PATH=$PATH:/usr/local/go/bin:$HOME/go/bin' >> /home/ubuntu/.bashrc
+  - echo 'export GOPATH=$HOME/go' >> /home/ubuntu/.bashrc
+  - mkdir -p /home/ubuntu/go/{src,bin,pkg}
+  - chown -R ubuntu:ubuntu /home/ubuntu/go
+  - rm -rf /tmp/go.tar.gz /tmp/go-extract
+
+  # --- Kargo CLI (ARM64) ---
+  - KARGO_VER=$(curl -s https://api.github.com/repos/akuity/kargo/releases/latest | grep tag_name | cut -d '"' -f 4)
+  - curl -L -o /tmp/kargo "https://github.com/akuity/kargo/releases/download/${KARGO_VER}/kargo-linux-arm64"
+  - mv /tmp/kargo /usr/local/bin/
+  - chmod +x /usr/local/bin/kargo
+  - rm -rf /tmp/kargo
+
+  # Set file backend for AWS Vault
+  - echo 'export AWS_VAULT_BACKEND=file' >> /home/ubuntu/.bashrc
