@@ -46,7 +46,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup: common deps
+      - name: Setup common deps
         run: |
           sudo apt-get update -y
           sudo apt-get install -y qemu-system-x86 genisoimage cloud-image-utils qemu-utils socat netcat-openbsd expect
@@ -64,213 +64,214 @@ jobs:
           FILE="${{ matrix.path }}"
           # Basic YAML parse test
           python3 - <<PY
-  import sys, yaml, pathlib
-  p=pathlib.Path("${{ matrix.path }}")
-  data = yaml.safe_load(p.read_text())
-  print("YAML parsed OK for", p)
-  PY
-  # cloud-init schema check (if cloud-init is available)
-  if command -v cloud-init >/dev/null 2>&1; then
-  cloud-init devel schema --config-file "${{ matrix.path }}" || true
-  echo "cloud-init schema check completed (exit non-zero doesn't necessarily mean fatal)"
-  else
-  echo "cloud-init not installed for schema check"
-  fi
+          import sys, yaml, pathlib
+          p=pathlib.Path("${{ matrix.path }}")
+          data = yaml.safe_load(p.read_text())
+          print("YAML parsed OK for", p)
+          PY
+          # cloud-init schema check (if cloud-init is available)
+          if command -v cloud-init >/dev/null 2>&1; then
+          cloud-init devel schema --config-file "${{ matrix.path }}" || true
+          echo "cloud-init schema check completed (exit non-zero doesn't necessarily mean fatal)"
+          else
+          echo "cloud-init not installed for schema check"
+          fi
 
-# For ARM we do schema-only (per Q7=1)
-- name: Skip QEMU boot for ARM (schema-only)
-  if: matrix.arch == 'arm'
-  run: |
-    echo "ARM file schema checked. Full boot-test skipped on x86 runners per pipeline policy."
+      # For ARM we do schema-only (per Q7=1)
+      - name: Skip QEMU boot for ARM (schema-only)
+        if: matrix.arch == 'arm'
+        run: |
+          echo "ARM file schema checked. Full boot-test skipped on x86 runners per pipeline policy."
 
-# AMD boot/test path
-- name: AMD: Boot + verify in QEMU (headless, console)
-  if: matrix.arch == 'amd'
-  env:
-    IMAGE_URL: ${{ env.UBUNTU_CLOUD_IMG_URL }}
-    SERIAL_PORT: ${{ env.QEMU_SERIAL_PORT }}
-    CLOUDINIT_WAIT_TIMEOUT: ${{ env.CLOUDINIT_WAIT_TIMEOUT }}
-  run: |
-    set -xeuo pipefail
-    WORKDIR=$(pwd)/.gha-qemu-${{ matrix.stack }}-${{ matrix.arch }}
-    rm -rf "$WORKDIR"
-    mkdir -p "$WORKDIR"
-    cd "$WORKDIR"
-    
-    # 1) fetch cloud image (cache by job workspace)
-    IMGNAME=$(basename "$IMAGE_URL")
-    if [ ! -f "$IMGNAME" ]; then
-      curl -sfSL -o "$IMGNAME" "$IMAGE_URL"
-    fi
-    
-    # 2) copy the cloud-init user-data we are testing to a local file
-    cp "${{ github.workspace }}/${{ matrix.path }}" user-data-original.yaml
-    
-    # 3) produce a seed iso from the user's cloud-init file
-    #    Note: cloud-localds takes a user-data file and optional meta-data file.
-    #    We'll create simple meta-data for hostname so cloud-init is happier.
-    cat > meta-data <<'META'
-instance-id: ci-test-instance
-local-hostname: ci-test
-  META
-  
-  # create seed.iso (will be attached as first CD-ROM)
-  cloud-localds seed.iso user-data-original.yaml meta-data
-  
-  # 4) build a second small ISO that contains the verify script we want to run inside the VM
-  #    We place the verify script at /verify-inside-vm.sh inside the ISO root.
-  #    The verify script will be invoked by console commands after cloud-init completes.
-  VERIFY_SRC="${{ github.workspace }}/${{ matrix.verify }}"
-  VERIFY_NAME=$(basename "$VERIFY_SRC")
-  mkdir -p iso-root
-  cp "$VERIFY_SRC" iso-root/verify-inside-vm.sh
-  chmod +x iso-root/verify-inside-vm.sh
-  genisoimage -output verify.iso -volid VERIFY -joliet -rock iso-root
-  
-  # 5) prepare a qcow2 overlay image to boot the downloaded cloud image
-  QEMU_IMG=vm.qcow2
-  if [ ! -f "$QEMU_IMG" ]; then
-  qemu-img create -f qcow2 -b "$IMGNAME" -F qcow2 "$QEMU_IMG" 5G
-  fi
-  
-  # 6) start qemu, headless, with serial connected to TCP port
-  #    -nographic disables graphical output; -serial tcp:127.0.0.1:PORT,server,nowait opens a listening TCP port
-  #    NOTE: We purposely background qemu. qemu process output is logged to qemu.log
-  QEMU_PID_FILE=qemu.pid
-  qemu-system-x86_64 \
-  -m 2048 \
-  -smp 2 \
-  -drive file="$QEMU_IMG",if=virtio,format=qcow2 \
-  -cdrom seed.iso \
-  -drive if=cdrom,file=verify.iso,media=cdrom \
-  -netdev user,id=net0,hostfwd=tcp::2222-:22 \
-  -device virtio-net-pci,netdev=net0 \
-  -nographic \
-  -serial tcp:127.0.0.1:${SERIAL_PORT},server,nowait \
-  >/tmp/qemu.stdout 2>/tmp/qemu.stderr &
-  
-  echo $! > "$QEMU_PID_FILE"
-  echo "qemu pid $(cat $QEMU_PID_FILE)"
-  
-  # 7) Wait for the serial TCP server to be available
-  SECONDS_WAITED=0
-  until nc -z 127.0.0.1 ${SERIAL_PORT} >/dev/null 2>&1 || [ $SECONDS_WAITED -ge 30 ]; do
-  SECONDS_WAITED=$((SECONDS_WAITED+1))
-  sleep 1
-  done
-  if ! nc -z 127.0.0.1 ${SERIAL_PORT}; then
-  echo "serial port never became available"
-  tail -n +1 /tmp/qemu.stderr || true
-  tail -n +1 /tmp/qemu.stdout || true
-  kill $(cat $QEMU_PID_FILE) || true
-  exit 1
-  fi
-  echo "serial port is listening on ${SERIAL_PORT}"
-  
-  # 8) Capture serial output into a file (background)
-  #    We connect with netcat and write serial output to serial.log
-  #    Note: netcat will exit when the other end closes; we background it.
-  ( nc 127.0.0.1 ${SERIAL_PORT} > serial.log ) &
-  NC_RECV_PID=$!
-  
-  # 9) Wait (up to CLOUDINIT_WAIT_TIMEOUT) for cloud-init to finish as indicated on the serial console
-  echo "Waiting up to ${CLOUDINIT_WAIT_TIMEOUT}s for cloud-init to report done on serial console..."
-  TIMEOUT="$CLOUDINIT_WAIT_TIMEOUT"
-  START=$(date +%s)
-  while true; do
-  if grep -Ei "cloud-init.*(status|finished|finished.*modules).*done" serial.log -m1 >/dev/null 2>&1; then
-  echo "Detected cloud-init done on console."
-  break
-  fi
-  NOW=$(date +%s)
-  ELAPSED=$((NOW-START))
-  if [ "$ELAPSED" -ge "$TIMEOUT" ]; then
-  echo "Timed out waiting for cloud-init to finish. Serial log (last 500 lines):"
-  tail -n 500 serial.log || true
-  kill $NC_RECV_PID || true
-  kill $(cat $QEMU_PID_FILE) || true
-  exit 2
-  fi
-  sleep 5
-  done
-  
-  # 10) Try to mount the second CDROM and run the verify script inside the guest via serial tty.
-  #     We will issue a sequence of keystrokes to the VM serial console to:
-  #       - run a command to find and mount the verify ISO (possible device /dev/sr1 or /dev/sr0)
-  #       - execute the script from the mounted ISO, e.g. /mnt/verify/verify-inside-vm.sh
-  #
-  #     We send keystrokes by connecting to the serial port and writing the commands.
-  #
-  # NOTE: The exact login/console state depends on your cloud image & user-data.
-  #       This approach assumes a root shell or at least a shell accessible on the serial console.
-  #
-  # Send a small shell script over the serial connection that:
-  #  - tries /dev/sr1 then /dev/sr0 to mount the CD
-  #  - mounts it at /mnt/verify and runs the script
-  #
-  CMD=$'#!/bin/bash\nset -e\nfor dev in /dev/sr1 /dev/sr0; do if [ -b \"$dev\" ]; then mkdir -p /mnt/verify || true; mount \"$dev\" /mnt/verify 2>/dev/null && echo mounted \"$dev\" && break; fi; done\necho \"Contents of /mnt/verify:\"; ls -la /mnt/verify || true\nchmod +x /mnt/verify/verify-inside-vm.sh || true\n/mnt/verify/verify-inside-vm.sh ; echo EXIT_CODE=$?\n'
-  # Escape for single-line send via printf
-  # we will send this to the serial port using netcat
-  printf "%s\n" "$CMD" > send-cmds.sh
-  chmod +x send-cmds.sh
-  
-  # Send the commands to the serial port. We send them slowly to simulate typing.
-  # This requires the guest to have an interactive shell on the serial console that accepts input.
-  # If necessary, tune the sleeps/delays below.
-  (
-  # tiny helper: prints each line with small delay
-  while IFS= read -r line; do
-  printf "%s\n" "$line"
-  sleep 0.25
-  done < send-cmds.sh
-  ) | nc 127.0.0.1 ${SERIAL_PORT} &
-  
-  # allow verify script to run and capture output
-  echo "Allowing ${CLOUDINIT_WAIT_TIMEOUT}s for verify script to run..."
-  sleep 10
-  # now tail the serial log to find the verify script exit code
-  TIMEOUT2=120
-  START2=$(date +%s)
-  FOUND=0
-  while true; do
-  if grep -E "EXIT_CODE=" serial.log -m1 >/dev/null 2>&1; then
-  FOUND=1
-  break
-  fi
-  NOW2=$(date +%s)
-  ELAPSED2=$((NOW2-START2))
-  if [ "$ELAPSED2" -ge "$TIMEOUT2" ]; then
-  echo "Timed out waiting for verify script to finish. Serial log (last 500 lines):"
-  tail -n 500 serial.log || true
-  break
-  fi
-  sleep 2
-  done
-  
-  # report serial snippet
-  echo "=== serial.log (tail 200) ==="
-  tail -n 200 serial.log || true
-  echo "=== end serial.log ==="
-  
-  if [ "$FOUND" -ne 1 ]; then
-  echo "verify script did not report EXIT_CODE. Failing."
-  kill $NC_RECV_PID || true
-  kill $(cat $QEMU_PID_FILE) || true
-  exit 3
-  fi
-  
-  # get the exit code
-  EXIT_CODE_LINE=$(grep -E "EXIT_CODE=" serial.log | tail -n 1)
-  # parse
-  EXIT_CODE=$(echo "$EXIT_CODE_LINE" | sed -E 's/.*EXIT_CODE=([0-9]+).*/\1/')
-echo "verify script exit code: $EXIT_CODE"
+      # AMD boot/test path
+      - name: AMD Boot + verify in QEMU (headless, console)
+        if: matrix.arch == 'amd'
+        env:
+          IMAGE_URL: ${{ env.UBUNTU_CLOUD_IMG_URL }}
+          SERIAL_PORT: ${{ env.QEMU_SERIAL_PORT }}
+          CLOUDINIT_WAIT_TIMEOUT: ${{ env.CLOUDINIT_WAIT_TIMEOUT }}
+        run: |
+          set -xeuo pipefail
+          WORKDIR=$(pwd)/.gha-qemu-${{ matrix.stack }}-${{ matrix.arch }}
+          rm -rf "$WORKDIR"
+          mkdir -p "$WORKDIR"
+          cd "$WORKDIR"
+          
+          # 1) fetch cloud image (cache by job workspace)
+          IMGNAME=$(basename "$IMAGE_URL")
+          if [ ! -f "$IMGNAME" ]; then
+            curl -sfSL -o "$IMGNAME" "$IMAGE_URL"
+          fi
+          
+          # 2) copy the cloud-init user-data we are testing to a local file
+          cp "${{ github.workspace }}/${{ matrix.path }}" user-data-original.yaml
+          
+          # 3) produce a seed iso from the user's cloud-init file
+          #    Note: cloud-localds takes a user-data file and optional meta-data file.
+          #    We'll create simple meta-data for hostname so cloud-init is happier.
+          cat > meta-data <<'META'
+          instance-id: ci-test-instance
+          local-hostname: ci-test
+          META
+        
+          # create seed.iso (will be attached as first CD-ROM)
+          cloud-localds seed.iso user-data-original.yaml meta-data
+          
+          # 4) build a second small ISO that contains the verify script we want to run inside the VM
+          #    We place the verify script at /verify-inside-vm.sh inside the ISO root.
+          #    The verify script will be invoked by console commands after cloud-init completes.
+          VERIFY_SRC="${{ github.workspace }}/${{ matrix.verify }}"
+          VERIFY_NAME=$(basename "$VERIFY_SRC")
+          mkdir -p iso-root
+          cp "$VERIFY_SRC" iso-root/verify-inside-vm.sh
+          chmod +x iso-root/verify-inside-vm.sh
+          genisoimage -output verify.iso -volid VERIFY -joliet -rock iso-root
+          
+          # 5) prepare a qcow2 overlay image to boot the downloaded cloud image
+          QEMU_IMG=vm.qcow2
+          if [ ! -f "$QEMU_IMG" ]; then
+          qemu-img create -f qcow2 -b "$IMGNAME" -F qcow2 "$QEMU_IMG" 5G
+          fi
+          
+          # 6) start qemu, headless, with serial connected to TCP port
+          #    -nographic disables graphical output; -serial tcp:127.0.0.1:PORT,server,nowait opens a listening TCP port
+          #    NOTE: We purposely background qemu. qemu process output is logged to qemu.log
+          QEMU_PID_FILE=qemu.pid
+          qemu-system-x86_64 \
+          -m 2048 \
+          -smp 2 \
+          -drive file="$QEMU_IMG",if=virtio,format=qcow2 \
+          -cdrom seed.iso \
+          -drive if=cdrom,file=verify.iso,media=cdrom \
+          -netdev user,id=net0,hostfwd=tcp::2222-:22 \
+          -device virtio-net-pci,netdev=net0 \
+          -nographic \
+          -serial tcp:127.0.0.1:${SERIAL_PORT},server,nowait \
+          >/tmp/qemu.stdout 2>/tmp/qemu.stderr &
+          
+          echo $! > "$QEMU_PID_FILE"
+          echo "qemu pid $(cat $QEMU_PID_FILE)"
+          
+          # 7) Wait for the serial TCP server to be available
+          SECONDS_WAITED=0
+          until nc -z 127.0.0.1 ${SERIAL_PORT} >/dev/null 2>&1 || [ $SECONDS_WAITED -ge 30 ]; do
+          SECONDS_WAITED=$((SECONDS_WAITED+1))
+          sleep 1
+          done
+          if ! nc -z 127.0.0.1 ${SERIAL_PORT}; then
+          echo "serial port never became available"
+          tail -n +1 /tmp/qemu.stderr || true
+          tail -n +1 /tmp/qemu.stdout || true
+          kill $(cat $QEMU_PID_FILE) || true
+          exit 1
+          fi
+          echo "serial port is listening on ${SERIAL_PORT}"
+          
+          # 8) Capture serial output into a file (background)
+          #    We connect with netcat and write serial output to serial.log
+          #    Note: netcat will exit when the other end closes; we background it.
+          ( nc 127.0.0.1 ${SERIAL_PORT} > serial.log ) &
+          NC_RECV_PID=$!
+          
+          # 9) Wait (up to CLOUDINIT_WAIT_TIMEOUT) for cloud-init to finish as indicated on the serial console
+          echo "Waiting up to ${CLOUDINIT_WAIT_TIMEOUT}s for cloud-init to report done on serial console..."
+          TIMEOUT="$CLOUDINIT_WAIT_TIMEOUT"
+          START=$(date +%s)
+          while true; do
+          if grep -Ei "cloud-init.*(status|finished|finished.*modules).*done" serial.log -m1 >/dev/null 2>&1; then
+          echo "Detected cloud-init done on console."
+          break
+          fi
+          NOW=$(date +%s)
+          ELAPSED=$((NOW-START))
+          if [ "$ELAPSED" -ge "$TIMEOUT" ]; then
+          echo "Timed out waiting for cloud-init to finish. Serial log (last 500 lines):"
+          tail -n 500 serial.log || true
+          kill $NC_RECV_PID || true
+          kill $(cat $QEMU_PID_FILE) || true
+          exit 2
+          fi
+          sleep 5
+          done
+          
+          # 10) Try to mount the second CDROM and run the verify script inside the guest via serial tty.
+          #     We will issue a sequence of keystrokes to the VM serial console to:
+          #       - run a command to find and mount the verify ISO (possible device /dev/sr1 or /dev/sr0)
+          #       - execute the script from the mounted ISO, e.g. /mnt/verify/verify-inside-vm.sh
+          #
+          #     We send keystrokes by connecting to the serial port and writing the commands.
+          #
+          # NOTE: The exact login/console state depends on your cloud image & user-data.
+          #       This approach assumes a root shell or at least a shell accessible on the serial console.
+          #
+          # Send a small shell script over the serial connection that:
+          #  - tries /dev/sr1 then /dev/sr0 to mount the CD
+          #  - mounts it at /mnt/verify and runs the script
+          #
+          CMD=$'#!/bin/bash\nset -e\nfor dev in /dev/sr1 /dev/sr0; do if [ -b \"$dev\" ]; then mkdir -p /mnt/verify || true; mount \"$dev\" /mnt/verify 2>/dev/null && echo mounted \"$dev\" && break; fi; done\necho \"Contents of /mnt/verify:\"; ls -la /mnt/verify || true\nchmod +x /mnt/verify/verify-inside-vm.sh || true\n/mnt/verify/verify-inside-vm.sh ; echo EXIT_CODE=$?\n'
+          # Escape for single-line send via printf
+          # we will send this to the serial port using netcat
+          printf "%s\n" "$CMD" > send-cmds.sh
+          chmod +x send-cmds.sh
+          
+          # Send the commands to the serial port. We send them slowly to simulate typing.
+          # This requires the guest to have an interactive shell on the serial console that accepts input.
+          # If necessary, tune the sleeps/delays below.
+          (
+          # tiny helper: prints each line with small delay
+          while IFS= read -r line; do
+          printf "%s\n" "$line"
+          sleep 0.25
+          done < send-cmds.sh
+          ) | nc 127.0.0.1 ${SERIAL_PORT} &
+          
+          # allow verify script to run and capture output
+          echo "Allowing ${CLOUDINIT_WAIT_TIMEOUT}s for verify script to run..."
+          sleep 10
+          # now tail the serial log to find the verify script exit code
+          TIMEOUT2=120
+          START2=$(date +%s)
+          FOUND=0
+          while true; do
+          if grep -E "EXIT_CODE=" serial.log -m1 >/dev/null 2>&1; then
+          FOUND=1
+          break
+          fi
+          NOW2=$(date +%s)
+          ELAPSED2=$((NOW2-START2))
+          if [ "$ELAPSED2" -ge "$TIMEOUT2" ]; then
+          echo "Timed out waiting for verify script to finish. Serial log (last 500 lines):"
+          tail -n 500 serial.log || true
+          break
+          fi
+          sleep 2
+          done
+          
+          # report serial snippet
+          echo "=== serial.log (tail 200) ==="
+          tail -n 200 serial.log || true
+          echo "=== end serial.log ==="
+          
+          if [ "$FOUND" -ne 1 ]; then
+          echo "verify script did not report EXIT_CODE. Failing."
+          kill $NC_RECV_PID || true
+          kill $(cat $QEMU_PID_FILE) || true
+          exit 3
+          fi
+          
+          # get the exit code
+          EXIT_CODE_LINE=$(grep -E "EXIT_CODE=" serial.log | tail -n 1)
+          # parse
+          EXIT_CODE=$(echo "$EXIT_CODE_LINE" | sed -E 's/.*EXIT_CODE=([0-9]+).*/\1/')
 
-# cleanup
-  kill $NC_RECV_PID || true
-  kill $(cat $QEMU_PID_FILE) || true
-  if [ "$EXIT_CODE" -ne 0 ]; then
-  echo "verify script returned non-zero -> FAIL"
-  exit $EXIT_CODE
-  fi
-  echo "AMD boot+verify succeeded."
+        echo "verify script exit code: $EXIT_CODE"
+        
+        # cleanup
+          kill $NC_RECV_PID || true
+          kill $(cat $QEMU_PID_FILE) || true
+          if [ "$EXIT_CODE" -ne 0 ]; then
+          echo "verify script returned non-zero -> FAIL"
+          exit $EXIT_CODE
+          fi
+          echo "AMD boot+verify succeeded."
 
