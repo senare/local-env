@@ -140,7 +140,7 @@ jobs:
           -smp 2 \
           -drive file="$QEMU_IMG",if=virtio,format=qcow2 \
           -cdrom seed.iso \
-          -drive if=cdrom,file=verify.iso,media=cdrom \
+          -drive file=verify.iso,format=raw,if=ide,media=cdrom \ 
           -netdev user,id=net0,hostfwd=tcp::2222-:22 \
           -device virtio-net-pci,netdev=net0 \
           -nographic \
@@ -158,8 +158,8 @@ jobs:
           done
           if ! nc -z 127.0.0.1 ${SERIAL_PORT}; then
           echo "serial port never became available"
-          tail -n +1 /tmp/qemu.stderr || true
-          tail -n +1 /tmp/qemu.stdout || true
+          tail -n 100 /tmp/qemu.stderr || true
+          tail -n 100 /tmp/qemu.stdout || true
           kill $(cat $QEMU_PID_FILE) || true
           exit 1
           fi
@@ -176,7 +176,7 @@ jobs:
           TIMEOUT="$CLOUDINIT_WAIT_TIMEOUT"
           START=$(date +%s)
           while true; do
-          if grep -Ei "cloud-init.*(status|finished|finished.*modules).*done" serial.log -m1 >/dev/null 2>&1; then
+          if grep -Ei "cloud-init.*(status|finished|modules).*done" serial.log -m1 >/dev/null 2>&1; then
           echo "Detected cloud-init done on console."
           break
           fi
