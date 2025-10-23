@@ -77,13 +77,11 @@ jobs:
           echo "cloud-init not installed for schema check"
           fi
 
-      # For ARM we do schema-only (per Q7=1)
       - name: Skip QEMU boot for ARM (schema-only)
         if: matrix.arch == 'arm'
         run: |
           echo "ARM file schema checked. Full boot-test skipped on x86 runners per pipeline policy."
 
-      # AMD boot/test path
       - name: AMD Boot + verify in QEMU (headless, console)
         if: matrix.arch == 'amd'
         env:
@@ -264,9 +262,8 @@ jobs:
           # parse
           EXIT_CODE=$(echo "$EXIT_CODE_LINE" | sed -E 's/.*EXIT_CODE=([0-9]+).*/\1/')
 
-        echo "verify script exit code: $EXIT_CODE"
+          echo "verify script exit code: $EXIT_CODE"
         
-        # cleanup
           kill $NC_RECV_PID || true
           kill $(cat $QEMU_PID_FILE) || true
           if [ "$EXIT_CODE" -ne 0 ]; then
@@ -274,4 +271,3 @@ jobs:
           exit $EXIT_CODE
           fi
           echo "AMD boot+verify succeeded."
-
